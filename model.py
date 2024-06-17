@@ -1,35 +1,28 @@
-import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+import torch
 
-class StreamingTransformerModel(nn.Module):
-    def __init__(self, input_dim, output_dim, num_heads, num_layers, dropout, num_classes):
-        super(StreamingTransformerModel, self).__init__()
-        self.encoder = nn.Linear(input_dim, output_dim)
-        self.transformer_decoder_layer = nn.TransformerDecoderLayer(d_model=output_dim, nhead=num_heads, dropout=dropout)
-        self.transformer_decoder = nn.TransformerDecoder(self.transformer_decoder_layer, num_layers=num_layers)
-        self.output_layer = nn.Linear(output_dim, num_classes)
-        self.memory = None
-
-    def forward(self, x, reset_memory=False):
-        # Reshape input x from (batch_size, channels, chunk_size) to (batch_size * channels, chunk_size)
-        batch_size, channels, chunk_size = x.size()
-        x = x.view(batch_size * channels, chunk_size)
-
-        if reset_memory or self.memory is None:
-            self.memory = self.encoder(x)
-        else:
-            new_memory = self.encoder(x)
-            self.memory = torch.cat((self.memory, new_memory), dim=1)
-
-        # Reshape memory back to (batch_size * channels, seq_len, output_dim)
-        batch_size_channels, seq_len = self.memory.size()
-        seq_len //= channels
-        self.memory = self.memory.view(batch_size * channels, seq_len, -1)
+class StreamingTransformer(nn.Module):
+    def __init__(self, chunk_size=512, num_classes=21, d_model=128, nhead=8, num_layers=6):
+        super(StreamingTransformer, self).__init__()
+        self.chunk_size = chunk_size
+        self.d_model = d_model
         
-        decoder_input = torch.zeros(batch_size * channels, seq_len, self.memory.size(-1), device=self.memory.device)
-        output = self.transformer_decoder(decoder_input, self.memory)
-        output = self.output_layer(output)
+        self.embedding = nn.Linear(3 * chunk_size, d_model)
+        encoder_layers = TransformerEncoderLayer(d_model, nhead)
+        self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers)
+        self.fc = nn.Linear(d_model, num_classes * chunk_size)
         
-        # Reshape output back to (batch_size, channels, seq_len, num_classes)
-        output = output.view(batch_size, channels, seq_len, -1)
-        return output
+    def forward(self, x, state=None):
+        batch_size = x.size(0)
+        x = x.view(batch_size, -1)  # Flatten the input
+        x = self.embedding(x)
+        if state is None:
+            state = torch.zeros((batch_size, 1, self.d_model), device=x.device)
+        x = x.unsqueeze(1) + state  # Add sequence dimension and combine with previous state
+        x = self.transformer_encoder(x)
+        state = x[:, -1, :].unsqueeze(1)  # Update state with the last hidden state
+        
+        x = self.fc(x).view(batch_size, self.chunk_size, -1)  # Reshape to (batch_size, chunk_size, num_classes)
+        return x, state
